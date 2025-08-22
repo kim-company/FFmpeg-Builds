@@ -1,10 +1,6 @@
 name: Build FFmpeg
 
 on:
-  push:
-    paths-ignore:
-      - '**.md'
-      - 'LICENSE'
   workflow_dispatch:
     inputs:
       doRelease:
@@ -17,8 +13,6 @@ on:
         type: boolean
         default: false
         required: false
-  schedule:
-    - cron: '0 12 * * *'
 
 env:
   DOCKER_BUILDKIT: 1
@@ -52,7 +46,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [ubuntu-latest,ubuntu-24.04-arm]
+        runner: [ubuntu-latest]
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Free Disk-Space
