@@ -37,8 +37,8 @@ cat <<EOF >"$BUILD_SCRIPT"
     cd ffmpeg
 
     for patch in $(ROOT_DIR)/patches/ffmpeg/*.patch; do
-        echo "Applying $patch"
-        git am < "$patch"
+        echo "Applying \$patch"
+        git am < "\$patch"
     done
 
     ./configure --prefix=/ffbuild/prefix --pkg-config-flags="--static" \$FFBUILD_TARGET_FLAGS \$FF_CONFIGURE \
