@@ -25,6 +25,7 @@ GIT_BRANCH="${GIT_BRANCH:-master}"
 GIT_BRANCH="${GIT_BRANCH_OVERRIDE:-$GIT_BRANCH}"
 
 BUILD_SCRIPT="$(mktemp)"
+ROOT_DIR="$(pwd)"
 trap "rm -f -- '$BUILD_SCRIPT'" EXIT
 
 cat <<EOF >"$BUILD_SCRIPT"
@@ -35,7 +36,7 @@ cat <<EOF >"$BUILD_SCRIPT"
     git clone --filter=blob:none --branch='$GIT_BRANCH' '$FFMPEG_REPO' ffmpeg
     cd ffmpeg
 
-    for patch in /ffmpeg/patches/ffmpeg/*.patch; do
+    for patch in $(ROOT_DIR)/ffmpeg/patches/ffmpeg/*.patch; do
         echo "Applying $patch"
         git am < "$patch"
     done
