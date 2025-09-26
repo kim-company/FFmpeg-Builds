@@ -35,7 +35,7 @@ cat <<EOF >"$BUILD_SCRIPT"
     git clone --filter=blob:none --branch='$GIT_BRANCH' '$FFMPEG_REPO' ffmpeg
     cd ffmpeg
 
-    for patch in ../patches/ffmpeg/*.patch; do
+    for patch in $(dirname "$0")/patches/ffmpeg/*.patch; do
         echo "Applying $patch"
         git am < "$patch"
     done
