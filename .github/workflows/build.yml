@@ -1,48 +1,46 @@
 name: Build FFmpeg
 
 on:
+  push:
+    branches:
+      - '**'
+    tags:
+      - 'ffmpeg-*'
   workflow_dispatch:
-    inputs:
-      doRelease:
-        description: 'Publish new release'
-        type: boolean
-        default: false
-        required: false
-      buildOnly:
-        description: 'Only build ffmpeg'
-        type: boolean
-        default: false
-        required: false
+
+permissions:
+  contents: write
+  packages: write
 
 env:
   DOCKER_BUILDKIT: 1
+  RELEASE_BUILD: ${{ startsWith(github.ref, 'refs/tags/ffmpeg-') }}
 
 jobs:
-  pre_check:
-    name: Pre Checks
-    if: ${{ github.event.inputs.buildOnly != 'true' }}
+  validate:
+    name: Validate patch stack
     runs-on: ubuntu-latest
     steps:
-      - name: Repo Check
-        if: ${{ github.event_name == 'schedule' }}
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Shell syntax
         run: |
-          if [[ "$GITHUB_REPOSITORY" != "BtbN/FFmpeg-Builds" ]]; then
-            echo "When forking this repository to make your own builds, you have to adjust this check."
-            echo "When doing so make sure to randomize the scheduled cron time above, in order to spread out the various build times as much as possible."
-            echo "This has been put in place due to the enormous amounts of traffic hundreds/thousands of parallel builds can cause on external infrastructure."
-            # Set Github job summary (see https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/workflow-commands-for-github-actions#adding-a-job-summary):
-            echo "# To enable scheduled builds, please make the following 2 edits to [.github/workflows/build.yml](https://github.com/$GITHUB_REPOSITORY/edit/$GITHUB_REF_NAME/.github/workflows/build.yml):" >> "$GITHUB_STEP_SUMMARY"
-            echo '1. **IMPORTANT:** Change the 2 numbers on the `cron:` line. The first number must be between 0 and 59, and the second must be between 0 and 23.' >> "$GITHUB_STEP_SUMMARY"
-            echo '2. Use `find and replace` (ctrl+f) to replace `BtbN/FFmpeg-Builds` with your repository name' >> "$GITHUB_STEP_SUMMARY"
-            echo  >> "$GITHUB_STEP_SUMMARY" # adds blank line to markdown
-            echo "This safeguard exists to  avoid overwhelming important open-source infrastructure (see https://github.com/BtbN/FFmpeg-Builds/issues/278)" >> "$GITHUB_STEP_SUMMARY"
-            exit 1
-          fi
-          exit 0
+          bash -n build.sh makeimage.sh generate.sh download.sh
+      - name: Verify FFmpeg patches apply to upstream release/8.0
+        run: |
+          set -xe
+          git clone --filter=blob:none --branch=release/8.0 https://github.com/FFmpeg/FFmpeg.git ffmpeg-upstream
+          cd ffmpeg-upstream
+          shopt -s nullglob
+          for patch in ../patches/ffmpeg/*.patch; do
+            echo "Applying $patch"
+            git -c user.name=ffbuild -c user.email=ffbuild@example.invalid am < "$patch"
+          done
+
   build_base:
     name: Build base image
-    if: ${{ github.event.inputs.buildOnly != 'true' }}
-    needs: pre_check
+    if: ${{ startsWith(github.ref, 'refs/tags/ffmpeg-') }}
+    needs: validate
     strategy:
       fail-fast: false
       matrix:
@@ -120,15 +118,16 @@ jobs:
           repository: ${{ github.repository }}
           owner_type: user
           untagged_only: true
+
   build_target_bases:
     name: Build target base image
-    if: ${{ github.event.inputs.buildOnly != 'true' }}
+    if: ${{ startsWith(github.ref, 'refs/tags/ffmpeg-') }}
     needs: build_base
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        target: [linux64]
+        target: [linux64, linuxarm64]
     steps:
       - name: Free Disk-Space
         run: df -h && sudo apt-get clean && docker system prune -a -f && sudo rm -rf /opt/ghc /usr/local/.ghcup /usr/local/lib/android && df -h
@@ -177,15 +176,16 @@ jobs:
           repository: ${{ github.repository }}
           owner_type: user
           untagged_only: true
+
   build_targets:
     name: Build target-variant image
-    if: ${{ github.event.inputs.buildOnly != 'true' }}
+    if: ${{ startsWith(github.ref, 'refs/tags/ffmpeg-') }}
     needs: build_target_bases
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        target: [linux64]
+        target: [linux64, linuxarm64]
         variant: [nonfree 8.0, nonfree-shared 8.0]
     steps:
       - name: Free Disk-Space
@@ -244,15 +244,16 @@ jobs:
           repository: ${{ github.repository }}
           owner_type: user
           untagged_only: true
+
   build_ffmpeg:
     name: Build ffmpeg
-    if: ${{ ( github.event.inputs.buildOnly == 'true' && !cancelled() ) || success() }}
+    if: ${{ startsWith(github.ref, 'refs/tags/ffmpeg-') }}
     needs: build_targets
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        target: [linux64]
+        target: [linux64, linuxarm64]
         variant: [nonfree 8.0, nonfree-shared 8.0]
     steps:
       - name: Free Disk-Space
@@ -280,9 +281,10 @@ jobs:
           name: ffmpeg-${{ steps.strs.outputs.artifact_slug }}
           overwrite: true
           path: artifacts/*
+
   publish_release:
-    name: Publish release
-    if: ${{ !cancelled() && ( github.event_name == 'schedule' || github.event.inputs.doRelease == 'true' ) && needs.build_ffmpeg.result == 'success' }}
+    name: Publish immutable release
+    if: ${{ startsWith(github.ref, 'refs/tags/ffmpeg-') }}
     needs: build_ffmpeg
     runs-on: ubuntu-latest
     steps:
@@ -297,38 +299,25 @@ jobs:
           merge-multiple: true
           path: artifacts
       - name: Create release
-        id: create_release
         run: |
           set -xe
           shopt -s nullglob
           RELDATE="$(date +'%Y-%m-%d %H:%M')"
-          NAME="Auto-Build $RELDATE"
-          TAGNAME="autobuild-$(date +'%Y-%m-%d-%H-%M')"
-          (cd artifacts && sha256sum *.{zip,tar.xz} > checksums.sha256)
-          gh release create "$TAGNAME" --target "master" --title "$NAME" artifacts/*.{zip,tar.xz} artifacts/checksums.*
-          echo "tag_name=${TAGNAME}" >> $GITHUB_OUTPUT
-          echo "rel_date=${RELDATE}" >> $GITHUB_OUTPUT
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-      - name: Update Latest
-        run: |
-          set -xe
-          shopt -s nullglob
-          mkdir latest_artifacts
-          ./util/repack_latest.sh latest_artifacts artifacts/*.{zip,tar.xz}
-          (cd latest_artifacts && sha256sum *.{zip,tar.xz} > checksums.sha256)
-          NAME="Latest Auto-Build (${{ steps.create_release.outputs.rel_date }})"
-          TAGNAME="latest"
-          gh release delete --cleanup-tag --yes "$TAGNAME" || true
-          sleep 15
-          gh release create "$TAGNAME" --target "master" --title "$NAME" latest_artifacts/*
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-      - name: Update Wiki
-        run: ./util/update_wiki.sh artifacts ${{ steps.create_release.outputs.tag_name }}
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-      - name: Prune old releases
-        run: ./util/prunetags.sh
+          TAGNAME="${GITHUB_REF#refs/tags/}"
+          NAME="FFmpeg Build $TAGNAME ($RELDATE)"
+          mkdir release_artifacts
+          ./util/repack_latest.sh release_artifacts artifacts/*.{zip,tar.xz}
+          (cd release_artifacts && sha256sum *.{zip,tar.xz} > checksums.sha256)
+          {
+            echo "Immutable FFmpeg build for $TAGNAME."
+            echo
+            echo "- Build repo commit: $GITHUB_SHA"
+            echo "- Upstream FFmpeg: https://github.com/FFmpeg/FFmpeg.git release/8.0"
+            echo "- Local patches:"
+            for patch in patches/ffmpeg/*.patch; do
+              echo "  - $(basename \"$patch\")"
+            done
+          } > release_notes.md
+          gh release create "$TAGNAME" --verify-tag --title "$NAME" --notes-file release_notes.md release_artifacts/*.{zip,tar.xz} release_artifacts/checksums.*
         env:
           GITHUB_TOKEN: ${{ github.token }}

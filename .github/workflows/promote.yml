@@ -1,0 +1,59 @@
+name: Promote FFmpeg Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      sourceTag:
+        description: 'Immutable source release tag to promote, e.g. ffmpeg-8.0.2-copyts-rollover.1'
+        type: string
+        required: true
+      channelTag:
+        description: 'Mutable channel tag to publish/update, e.g. stable-8.0, prod-8.0, latest'
+        type: string
+        required: true
+        default: stable-8.0
+
+permissions:
+  contents: write
+
+jobs:
+  promote:
+    name: Promote release assets
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Promote source release to channel
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          SOURCE_TAG: ${{ github.event.inputs.sourceTag }}
+          CHANNEL_TAG: ${{ github.event.inputs.channelTag }}
+        run: |
+          set -xeuo pipefail
+
+          if [[ -z "$SOURCE_TAG" || -z "$CHANNEL_TAG" ]]; then
+            echo "sourceTag and channelTag are required" >&2
+            exit 1
+          fi
+          if [[ "$SOURCE_TAG" == "$CHANNEL_TAG" ]]; then
+            echo "sourceTag and channelTag must differ" >&2
+            exit 1
+          fi
+
+          gh release view "$SOURCE_TAG" >/dev/null
+          git fetch --force origin "refs/tags/$SOURCE_TAG:refs/tags/$SOURCE_TAG"
+          TARGET_SHA="$(git rev-list -n 1 "$SOURCE_TAG")"
+
+          rm -rf promoted_assets
+          mkdir promoted_assets
+          gh release download "$SOURCE_TAG" --dir promoted_assets
+
+          gh release delete --cleanup-tag --yes "$CHANNEL_TAG" || true
+          sleep 15
+          gh release create "$CHANNEL_TAG" \
+            --target "$TARGET_SHA" \
+            --title "FFmpeg Build $CHANNEL_TAG (promoted from $SOURCE_TAG)" \
+            --notes "Promoted from immutable release $SOURCE_TAG." \
+            promoted_assets/*

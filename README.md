@@ -41,6 +41,12 @@ Every file corresponds to its respective package.
 
 On success, the resulting zip file will be in the `artifacts` subdir.
 
+FFmpeg itself is cloned from upstream `FFmpeg/FFmpeg` by default. Any patches in `patches/ffmpeg/*.patch` are applied with `git am` in lexical order before configure/build, so CI release builds include the same local FFmpeg patch stack.
+
+CI validates shell scripts and the FFmpeg patch stack on branch pushes. Full FFmpeg builds only run for tags matching `ffmpeg-*`; pushing such a tag builds and publishes an immutable release for that exact tag, using `latest`-style asset names so consumers can pin only the release tag in their download URL. Use tags like `ffmpeg-8.0.2-copyts-rollover.1` to encode the upstream FFmpeg version plus downstream patch/build revision.
+
+Mutable channels such as `stable-8.0`, `prod-8.0`, or `latest` are updated only by the `Promote FFmpeg Build` workflow, which copies assets from an immutable `ffmpeg-*` release without rebuilding.
+
 ### Targets, Variants and Addins
 
 Available targets:
