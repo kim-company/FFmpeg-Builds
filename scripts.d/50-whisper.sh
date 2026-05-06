@@ -10,9 +10,10 @@ ffbuild_depends() {
 }
 
 ffbuild_enabled() {
-    [[ $TARGET != *32 ]] || return -1
-    (( $(ffbuild_ffver) >= 800 )) || return -1
-    return 0
+    # Keep release builds focused on FFmpeg/media plumbing; do not ship whisper.cpp.
+    # It is a large optional dependency and currently fails in the linuxarm64
+    # target-variant image due to ggml Vulkan generated shader symbols.
+    return -1
 }
 
 ffbuild_dockerbuild() {
