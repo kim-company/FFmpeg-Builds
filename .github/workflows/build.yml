@@ -186,7 +186,7 @@ jobs:
       fail-fast: false
       matrix:
         target: [linux64, linuxarm64]
-        variant: [nonfree 8.0, nonfree-shared 8.0]
+        variant: [nonfree 8.0]
     steps:
       - name: Free Disk-Space
         run: df -h && sudo apt-get clean && docker system prune -a -f && sudo rm -rf /opt/ghc /usr/local/.ghcup /usr/local/lib/android && df -h
@@ -254,7 +254,7 @@ jobs:
       fail-fast: false
       matrix:
         target: [linux64, linuxarm64]
-        variant: [nonfree 8.0, nonfree-shared 8.0]
+        variant: [nonfree 8.0]
     steps:
       - name: Free Disk-Space
         run: df -h && sudo apt-get clean && docker system prune -a -f && sudo rm -rf /opt/ghc /usr/local/.ghcup /usr/local/lib/android && df -h
