@@ -1,78 +1,105 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Daniel Morandini <daniel.morandini@keepinmind.info>
-Date: Tue, 26 May 2026 10:03:50 +0200
-Subject: [PATCH] fftools/ffmpeg_demux: fix copyts MPEG-TS wrap on subtitles
+Date: Fri, 29 May 2026 11:20:00 +0200
+Subject: [PATCH] fftools/ffmpeg_demux: fix copyts MPEG-TS multi-wrap
 To: ffmpeg-devel@ffmpeg.org
 
-The copyts MPEG-TS wrap heuristic in ts_discontinuity_detect() previously
-reused the normal discontinuity-correction branch when adding one timestamp
-wrap to a packet DTS made it close to the expected next DTS. That branch
-snaps pkt->dts to ds->next_dts.
+Under -copyts, ts_discontinuity_detect() needs to distinguish an
+ordinary MPEG-TS PTS epoch wrap from a real input discontinuity. The
+previous copyts repair added one 33-bit wrap directly to packet DTS/PTS
+when that made the packet much closer to the expected next DTS. That
+covered the first reference crossing, including sparse DVB subtitle and
+DVB teletext packets whose spacing must not be collapsed to next_dts.
 
-For regularly paced audio/video streams that is usually close enough. For
-sparse subtitle streams, especially DVB teletext and DVB subtitle streams
-whose timestamps are derived from PCR, that snap can collapse adjacent
-packets onto a single timestamp. Once libavformat's wrap_timestamp() stops
-adjusting raw timestamps after they climb back past pts_wrap_reference, the
-subtitle DTS can regress by exactly 2^pts_wrap_bits. Downstream muxers then
-emit Non-monotonic DTS warnings and clamp the subtitle clock.
+Long-running looped MPEG-TS inputs can advance more than one physical
+PTS epoch and later return to the same raw timestamp phase. In that
+case the packet can be about 2 * 2^33 ticks behind ds->next_dts. Adding
+one wrap is still far away, so the old one-wrap-only guard declines the
+repair and the raw regressed DTS reaches the muxer/encoder path.
 
-Handle confirmed copyts MPEG-TS wraps directly: add one wrap period to the
-packet DTS and PTS, preserve the packet's spacing within the wrap epoch, and
-return without running the normal discontinuity branch. Audio/video continue
-to enter the detector as before. Subtitle streams enter it only under
--copyts, which keeps non-copyts subtitle behavior unchanged while covering
-the MPEG-TS rollover case.
+Generalise the copyts MPEG-TS repair to choose the nearest positive
+number of PTS wrap periods. Apply it only when the repaired DTS is still
+much closer than the raw DTS, and also within one eighth of a wrap, so
+large unrelated discontinuities are not silently fast-forwarded. Guard
+the packet tick addition against overflow before touching DTS/PTS.
 
-Reproduced with synthetic MPEG-TS fixtures containing video PCR plus DVB
-subtitle and DVB teletext subtitle PIDs. Without this change the last two
-subtitle packets are clamped at 15784527392. With this change they advance
-to 15789945392 and 15789997592. The matching FATE targets
-fate-mpegts-copyts-subtitle-wrap and fate-mpegts-copyts-teletext-wrap pass.
+Add in-tree FATE fixtures for the one-wrap DVB subtitle and teletext
+cases and a new DVB subtitle multi-wrap case. Without the multi-wrap
+repair, the final two packets in fate-mpegts-copyts-subtitle-multiwrap
+are clamped at 24374461984. With the repair, they advance to
+24379879984 and 24379923184.
 
 Signed-off-by: Daniel Morandini <daniel.morandini@keepinmind.info>
 ---
- fftools/ffmpeg_demux.c | 30 +++++++++++++++++++++++++-----
- 1 file changed, 25 insertions(+), 5 deletions(-)
+ fftools/ffmpeg_demux.c                          |  54 ++-
+ tests/Makefile                                  |  11 +-
+ tests/fate/mpegts.mak                           |  30 +-
+ tests/mpegtswrapgen.c                           | 539 ++++++++++++++++++++++++
+ tests/ref/fate/mpegts-copyts-subtitle-multiwrap |  24 ++
+ tests/ref/fate/mpegts-copyts-subtitle-wrap      |  10 +
+ tests/ref/fate/mpegts-copyts-teletext-wrap      |  10 +
+ 7 files changed, 669 insertions(+), 9 deletions(-)
 
 diff --git a/fftools/ffmpeg_demux.c b/fftools/ffmpeg_demux.c
-index 99f5cfc2c5..95cd5e1a63 100644
+index 1fee5c9e8e..d6465b7fe1 100644
 --- a/fftools/ffmpeg_demux.c
 +++ b/fftools/ffmpeg_demux.c
-@@ -234,13 +234,29 @@ static void ts_discontinuity_detect(Demuxer *d, InputStream *ist,
+@@ -224,13 +224,49 @@ static void ts_discontinuity_detect(Demuxer *d, InputStream *ist,
      int64_t pkt_dts = av_rescale_q_rnd(pkt->dts, pkt->time_base, AV_TIME_BASE_Q,
                                         AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX);
  
-+    // copyts MPEG-TS wrap: libavformat's wrap_timestamp() handles only the first
-+    // wrap and stops once raw timestamps climb back past pts_wrap_reference. For
-+    // continued operation across many wraps under -copyts, add exactly one wrap
-+    // period when the packet's timestamp + one wrap matches the expected next dts
-+    // far more closely than the raw timestamp does. Direct addition preserves
-+    // inter-packet timing within the wrap epoch, which matters for sparse
-+    // subtitle streams where snap-to-next_dts would collapse adjacent packets.
++    // copyts MPEG-TS wrap: libavformat's wrap_timestamp() adds at most one PTS
++    // epoch and stops once raw timestamps climb back past pts_wrap_reference.
++    // For continued operation across repeated wraps under -copyts, add the
++    // nearest positive number of wrap periods when that lands much closer to
++    // the expected next dts. Direct addition preserves inter-packet timing
++    // within the wrap epoch, which matters for sparse subtitle streams where
++    // snap-to-next_dts would collapse adjacent packets.
      if (copy_ts && ds->next_dts != AV_NOPTS_VALUE &&
          fmt_is_discont && ist->st->pts_wrap_bits < 60) {
 -        int64_t wrap_dts = av_rescale_q_rnd(pkt->dts + (1LL<<ist->st->pts_wrap_bits),
-+        int64_t wrap = 1LL << ist->st->pts_wrap_bits;
-+        int64_t wrap_dts = av_rescale_q_rnd(pkt->dts + wrap,
-                                             pkt->time_base, AV_TIME_BASE_Q,
-                                             AV_ROUND_NEAR_INF|AV_ROUND_PASS_MINMAX);
+-                                            pkt->time_base, AV_TIME_BASE_Q,
+-                                            AV_ROUND_NEAR_INF|AV_ROUND_PASS_MINMAX);
 -        if (FFABS(wrap_dts - ds->next_dts) < FFABS(pkt_dts - ds->next_dts)/10)
 -            disable_discontinuity_correction = 0;
-+        if (FFABS(wrap_dts - ds->next_dts) < FFABS(pkt_dts - ds->next_dts)/10) {
-+            pkt->dts += wrap;
-+            if (pkt->pts != AV_NOPTS_VALUE)
-+                pkt->pts += wrap;
-+            av_log(ist, AV_LOG_DEBUG,
-+                   "MPEG-TS pts wrap (stream id=%d): added %"PRId64" tick wrap\n",
-+                   ist->st->id, wrap);
-+            d->last_ts = av_rescale_q(pkt->dts, pkt->time_base, AV_TIME_BASE_Q);
-+            return;
++        int64_t wrap = 1LL << ist->st->pts_wrap_bits;
++        int64_t wrap_us = av_rescale_q(wrap, pkt->time_base, AV_TIME_BASE_Q);
++        int64_t delta = ds->next_dts - pkt_dts;
++
++        if (delta > 0 && wrap_us > 0) {
++            int64_t wraps = delta / wrap_us;
++            int64_t remainder = delta % wrap_us;
++
++            if (remainder >= wrap_us / 2)
++                wraps++;
++            if (wraps > 0 && wraps <= INT64_MAX / wrap) {
++                int64_t wrap_delta = wraps * wrap;
++
++                if (pkt->dts <= INT64_MAX - wrap_delta &&
++                    (pkt->pts == AV_NOPTS_VALUE || pkt->pts <= INT64_MAX - wrap_delta)) {
++                    int64_t wrap_dts = av_rescale_q_rnd(pkt->dts + wrap_delta,
++                                                        pkt->time_base, AV_TIME_BASE_Q,
++                                                        AV_ROUND_NEAR_INF|AV_ROUND_PASS_MINMAX);
++                    int64_t raw_delta = FFABS(pkt_dts - ds->next_dts);
++                    int64_t wrapped_delta = FFABS(wrap_dts - ds->next_dts);
++
++                    if (wrapped_delta < FFMIN(raw_delta / 10, wrap_us / 8)) {
++                        pkt->dts += wrap_delta;
++                        if (pkt->pts != AV_NOPTS_VALUE)
++                            pkt->pts += wrap_delta;
++                        av_log(ist, AV_LOG_DEBUG,
++                               "MPEG-TS pts wrap (stream id=%d): added %"PRId64" wrap(s), %"PRId64" ticks\n",
++                               ist->st->id, wraps, wrap_delta);
++                        d->last_ts = av_rescale_q(pkt->dts, pkt->time_base, AV_TIME_BASE_Q);
++                        return;
++                    }
++                }
++            }
 +        }
      }
  
      if (ds->next_dts != AV_NOPTS_VALUE && !disable_discontinuity_correction) {
-@@ -305,9 +321,13 @@ static void ts_discontinuity_process(Demuxer *d, InputStream *ist,
+@@ -296,9 +332,13 @@ static void ts_discontinuity_process(Demuxer *d, InputStream *ist,
      if (pkt->pts != AV_NOPTS_VALUE)
          pkt->pts += offset;
  
@@ -88,6 +115,676 @@ index 99f5cfc2c5..95cd5e1a63 100644
          pkt->dts != AV_NOPTS_VALUE)
          ts_discontinuity_detect(d, ist, pkt);
  }
+diff --git a/tests/Makefile b/tests/Makefile
+index 3f4dbaabfd..e3158a8637 100644
+--- a/tests/Makefile
++++ b/tests/Makefile
+@@ -47,11 +47,20 @@ tests/data/vsynth_lena.yuv: tests/rotozoom$(HOSTEXESUF) | tests/data
+ tests/data/vsynth3.yuv: tests/videogen$(HOSTEXESUF) | tests/data
+ 	$(M)$< $@ $(FATEW) $(FATEH)
+ 
++tests/data/mpegts_wrap_subtitle.ts: tests/mpegtswrapgen$(HOSTEXESUF) | tests/data
++	$(M)$< $@
++
++tests/data/mpegts_wrap_teletext.ts: tests/mpegtswrapgen$(HOSTEXESUF) | tests/data
++	$(M)$< $@ teletext
++
++tests/data/mpegts_multiwrap_subtitle.ts: tests/mpegtswrapgen$(HOSTEXESUF) | tests/data
++	$(M)$< $@ multiwrap
++
+ tests/test_copy.ffmeta: TAG = COPY
+ tests/test_copy.ffmeta: tests/data
+ 	$(M)cp -f $(SRC_PATH)/tests/test.ffmeta tests/test_copy.ffmeta
+ 
+-tests/data/%.sw tests/data/asynth% tests/data/vsynth%.yuv tests/vsynth%/00.pgm tests/data/%.nut: TAG = GEN
++tests/data/%.sw tests/data/asynth% tests/data/vsynth%.yuv tests/vsynth%/00.pgm tests/data/%.nut tests/data/mpegts_wrap_subtitle.ts tests/data/mpegts_wrap_teletext.ts tests/data/mpegts_multiwrap_subtitle.ts: TAG = GEN
+ 
+ tests/data/filtergraphs/%: TAG = COPY
+ tests/data/filtergraphs/%: $(SRC_PATH)/tests/filtergraphs/% | tests/data/filtergraphs
+diff --git a/tests/fate/mpegts.mak b/tests/fate/mpegts.mak
+index eaca8ec289..e2e112503a 100644
+--- a/tests/fate/mpegts.mak
++++ b/tests/fate/mpegts.mak
+@@ -22,4 +22,32 @@ fate-mpegts-probe-pmt-merge: CMD = run $(PROBE_CODEC_NAME_COMMAND) -merge_pmt_ve
+ 
+ FATE_SAMPLES_FFPROBE += $(FATE_MPEGTS_PROBE-yes)
+ 
+-fate-mpegts: $(FATE_MPEGTS_PROBE-yes)
++# Regression test for the copyts MPEG-TS PTS wrap on subtitle streams.
++# The fixture is synthesized in-tree by tests/mpegtswrapgen so the test runs
++# without external samples. Without the wrap fix in fftools/ffmpeg_demux.c the
++# subtitle DTS regresses by exactly 2^33 ticks at the wrap, which the muxer
++# clamps with "Non-monotonic DTS" warnings and a DTS+1 nudge per packet; the
++# framecrc captures the corrected DTS sequence and diverges on regression.
++FATE_MPEGTS-$(call FRAMECRC, MPEGTS, , DVBSUB_PARSER) += fate-mpegts-copyts-subtitle-wrap
++fate-mpegts-copyts-subtitle-wrap: tests/data/mpegts_wrap_subtitle.ts
++fate-mpegts-copyts-subtitle-wrap: CMD = framecrc -copyts -i $(TARGET_PATH)/tests/data/mpegts_wrap_subtitle.ts -map 0:s -c:s copy
++
++# Regression test for a source that has advanced two physical MPEG-TS PTS
++# epochs and then loops back to the same raw timestamp phase. The expected
++# packet DTS sequence stays in the second repaired epoch instead of falling
++# back by 2 * 2^33 ticks.
++FATE_MPEGTS-$(call FRAMECRC, MPEGTS, , DVBSUB_PARSER) += fate-mpegts-copyts-subtitle-multiwrap
++fate-mpegts-copyts-subtitle-multiwrap: tests/data/mpegts_multiwrap_subtitle.ts
++fate-mpegts-copyts-subtitle-multiwrap: CMD = framecrc -copyts -i $(TARGET_PATH)/tests/data/mpegts_multiwrap_subtitle.ts -map 0:s -c:s copy
++
++# Regression test for the same copyts MPEG-TS PTS wrap on DVB teletext
++# subtitle packets. The LMS path decodes these packets through libzvbi, but the
++# FATE assertion stays at packet-copy framecrc level so the expected timestamps
++# are independent of external libzvbi page-decoding behavior.
++FATE_MPEGTS-$(call FRAMECRC, MPEGTS, , ) += fate-mpegts-copyts-teletext-wrap
++fate-mpegts-copyts-teletext-wrap: tests/data/mpegts_wrap_teletext.ts
++fate-mpegts-copyts-teletext-wrap: CMD = framecrc -copyts -i $(TARGET_PATH)/tests/data/mpegts_wrap_teletext.ts -map 0:s -c:s copy
++
++FATE_FFMPEG += $(FATE_MPEGTS-yes)
++
++fate-mpegts: $(FATE_MPEGTS_PROBE-yes) $(FATE_MPEGTS-yes)
+diff --git a/tests/mpegtswrapgen.c b/tests/mpegtswrapgen.c
+new file mode 100644
+index 0000000000..a64dd91305
+--- /dev/null
++++ b/tests/mpegtswrapgen.c
+@@ -0,0 +1,539 @@
++/*
++ * Generator for a synthetic MPEG-TS file that exercises the 33-bit @ 90 kHz PTS
++ * wrap on a subtitle stream alongside an MPEG-2 video stream.
++ *
++ * Copyright (c) 2026 the FFmpeg developers
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++/*
++ * The default file emitted by this tool walks the wrap_timestamp() state
++ * machine in libavformat/demux.c through five phases (A anchor, B pre-wrap,
++ * C post-wrap, D approaching reference, E crossing reference from below).
++ * Phase E is where wrap_timestamp() deactivates and, without the fix in
++ * fftools/ffmpeg_demux.c (ts_discontinuity_detect's copyts MPEG-TS wrap path),
++ * the subtitle output regresses by exactly 2^33 ticks. The optional multiwrap
++ * scenario repeats that state-machine path after a second physical wrap, where
++ * the packet needs a 2 * 2^33 tick repair.
++ */
++
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#define TS_PACKET_SIZE 188
++#define PAT_PID   0x0000
++#define PMT_PID   0x1000
++#define VIDEO_PID 0x0100
++#define SUB_PID   0x0101
++#define STREAM_ID_VIDEO 0xE0
++#define STREAM_ID_PRIV1 0xBD
++
++#define PTS_WRAP_BITS 33
++#define WRAP_TICKS    (1LL << PTS_WRAP_BITS)
++#define HZ            90000
++
++static unsigned cc_video, cc_sub, cc_pat, cc_pmt;
++
++enum subtitle_kind {
++    SUBTITLE_KIND_DVBSUB,
++    SUBTITLE_KIND_TELETEXT,
++};
++
++enum scenario_kind {
++    SCENARIO_KIND_ONE_WRAP,
++    SCENARIO_KIND_MULTI_WRAP,
++};
++
++static const uint8_t ham8[16] = {
++    0x15, 0x02, 0x49, 0x5E, 0x64, 0x73, 0x38, 0x2F,
++    0xD0, 0xC7, 0x8C, 0x9B, 0xA1, 0xB6, 0xFD, 0xEA,
++};
++
++static uint32_t crc32_mpeg2(const uint8_t *data, size_t len)
++{
++    uint32_t crc = 0xFFFFFFFFu;
++    for (size_t i = 0; i < len; i++) {
++        crc ^= (uint32_t)data[i] << 24;
++        for (int b = 0; b < 8; b++)
++            crc = (crc & 0x80000000u) ? (crc << 1) ^ 0x04C11DB7u : (crc << 1);
++    }
++    return crc;
++}
++
++static void ts_header(uint8_t out[4], unsigned pid, int pusi, unsigned cc,
++                      int has_af, int has_payload)
++{
++    out[0] = 0x47;
++    out[1] = ((pusi & 1) << 6) | ((pid >> 8) & 0x1F);
++    out[2] = pid & 0xFF;
++    unsigned afc = ((has_af & 1) << 1) | (has_payload & 1);
++    out[3] = ((afc & 3) << 4) | (cc & 0x0F);
++}
++
++static void encode_pcr(uint8_t out[6], int64_t pcr_90k)
++{
++    int64_t base = pcr_90k & (WRAP_TICKS - 1);
++    out[0] = (base >> 25) & 0xFF;
++    out[1] = (base >> 17) & 0xFF;
++    out[2] = (base >>  9) & 0xFF;
++    out[3] = (base >>  1) & 0xFF;
++    out[4] = ((base & 1) << 7) | 0x7E;
++    out[5] = 0x00;
++}
++
++/* Build an adaptation field that occupies exactly target_len bytes (including
++ * the length byte). If pcr is non-negative, encodes a PCR in the body. */
++static int make_af(uint8_t *out, int target_len, int64_t pcr)
++{
++    if (target_len <= 0)
++        return 0;
++    if (target_len == 1) {
++        out[0] = 0;
++        return 1;
++    }
++    int idx = 0;
++    out[idx++] = (uint8_t)(target_len - 1); /* length byte (filled later) */
++    int flags_pos = idx;
++    out[idx++] = 0;
++    if (pcr >= 0) {
++        out[flags_pos] |= 0x10;
++        encode_pcr(&out[idx], pcr);
++        idx += 6;
++    }
++    while (idx < target_len)
++        out[idx++] = 0xFF;
++    return target_len;
++}
++
++static int write_pat(FILE *f)
++{
++    uint8_t section[64];
++    int idx = 0;
++    section[idx++] = 0x00; /* table_id */
++    /* section_length placeholder */
++    section[idx++] = 0;
++    section[idx++] = 0;
++    section[idx++] = 0x00; section[idx++] = 0x01; /* transport_stream_id */
++    section[idx++] = 0xC1; /* reserved/version/current */
++    section[idx++] = 0x00; /* section_number */
++    section[idx++] = 0x00; /* last_section_number */
++    section[idx++] = 0x00; section[idx++] = 0x01; /* program_number */
++    section[idx++] = 0xE0 | ((PMT_PID >> 8) & 0x1F);
++    section[idx++] = PMT_PID & 0xFF;
++    int section_length = idx - 3 + 4;
++    section[1] = 0xB0 | ((section_length >> 8) & 0x0F);
++    section[2] = section_length & 0xFF;
++    uint32_t crc = crc32_mpeg2(section, idx);
++    section[idx++] = (crc >> 24) & 0xFF;
++    section[idx++] = (crc >> 16) & 0xFF;
++    section[idx++] = (crc >>  8) & 0xFF;
++    section[idx++] =  crc        & 0xFF;
++
++    uint8_t pkt[TS_PACKET_SIZE];
++    ts_header(pkt, PAT_PID, 1, cc_pat++ & 0x0F, 0, 1);
++    pkt[4] = 0x00; /* pointer_field */
++    memcpy(&pkt[5], section, idx);
++    int filled = 5 + idx;
++    memset(&pkt[filled], 0xFF, TS_PACKET_SIZE - filled);
++    return fwrite(pkt, 1, TS_PACKET_SIZE, f) == TS_PACKET_SIZE ? 0 : -1;
++}
++
++static int write_pmt(FILE *f, enum subtitle_kind kind)
++{
++    uint8_t section[128];
++    int idx = 0;
++    section[idx++] = 0x02; /* table_id */
++    section[idx++] = 0; section[idx++] = 0; /* section_length placeholder */
++    section[idx++] = 0x00; section[idx++] = 0x01; /* program_number */
++    section[idx++] = 0xC1;
++    section[idx++] = 0x00;
++    section[idx++] = 0x00;
++    section[idx++] = 0xE0 | ((VIDEO_PID >> 8) & 0x1F); /* PCR_PID */
++    section[idx++] = VIDEO_PID & 0xFF;
++    section[idx++] = 0xF0; section[idx++] = 0x00; /* program_info_length */
++    /* Video ES */
++    section[idx++] = 0x02; /* stream_type = MPEG-2 video */
++    section[idx++] = 0xE0 | ((VIDEO_PID >> 8) & 0x1F);
++    section[idx++] = VIDEO_PID & 0xFF;
++    section[idx++] = 0xF0; section[idx++] = 0x00;
++    /* DVB subtitle ES */
++    section[idx++] = 0x06;
++    section[idx++] = 0xE0 | ((SUB_PID >> 8) & 0x1F);
++    section[idx++] = SUB_PID & 0xFF;
++    if (kind == SUBTITLE_KIND_TELETEXT) {
++        /* teletext_descriptor: language eng, subtitles page 888. */
++        section[idx++] = 0xF0; section[idx++] = 0x07;
++        section[idx++] = 0x56;
++        section[idx++] = 0x05;
++        section[idx++] = 'e'; section[idx++] = 'n'; section[idx++] = 'g';
++        section[idx++] = 0x08;
++        section[idx++] = 0x88;
++    } else {
++        /* ES_info_length = 10 (one subtitling_descriptor of length 8 + 2 header) */
++        section[idx++] = 0xF0; section[idx++] = 0x0A;
++        section[idx++] = 0x59; /* subtitling_descriptor */
++        section[idx++] = 0x08;
++        section[idx++] = 'e'; section[idx++] = 'n'; section[idx++] = 'g';
++        section[idx++] = 0x10; /* subtitling_type */
++        section[idx++] = 0x00; section[idx++] = 0x01; /* composition_page_id */
++        section[idx++] = 0x00; section[idx++] = 0x01; /* ancillary_page_id */
++    }
++
++    int section_length = idx - 3 + 4;
++    section[1] = 0xB0 | ((section_length >> 8) & 0x0F);
++    section[2] = section_length & 0xFF;
++    uint32_t crc = crc32_mpeg2(section, idx);
++    section[idx++] = (crc >> 24) & 0xFF;
++    section[idx++] = (crc >> 16) & 0xFF;
++    section[idx++] = (crc >>  8) & 0xFF;
++    section[idx++] =  crc        & 0xFF;
++
++    uint8_t pkt[TS_PACKET_SIZE];
++    ts_header(pkt, PMT_PID, 1, cc_pmt++ & 0x0F, 0, 1);
++    pkt[4] = 0x00;
++    memcpy(&pkt[5], section, idx);
++    int filled = 5 + idx;
++    memset(&pkt[filled], 0xFF, TS_PACKET_SIZE - filled);
++    return fwrite(pkt, 1, TS_PACKET_SIZE, f) == TS_PACKET_SIZE ? 0 : -1;
++}
++
++static void encode_pts(uint8_t out[5], unsigned prefix, int64_t pts)
++{
++    pts &= WRAP_TICKS - 1;
++    out[0] = (prefix << 4) | ((pts >> 29) & 0x0E) | 0x01;
++    out[1] = (pts >> 22) & 0xFF;
++    out[2] = ((pts >> 14) & 0xFE) | 0x01;
++    out[3] = (pts >>  7) & 0xFF;
++    out[4] = ((pts <<  1) & 0xFE) | 0x01;
++}
++
++static int write_pes_packet(FILE *f, unsigned pid, unsigned stream_id,
++                            int64_t pts_90k, int64_t pcr_90k,
++                            const uint8_t *payload, size_t payload_len,
++                            int pes_stuffing, unsigned *cc_state)
++{
++    uint8_t pes[256];
++    int pidx = 0;
++    pes[pidx++] = 0x00; pes[pidx++] = 0x00; pes[pidx++] = 0x01;
++    pes[pidx++] = stream_id & 0xFF;
++    /* PES_packet_length */
++    int body_len = 3 + 5 + pes_stuffing + payload_len;
++    pes[pidx++] = (body_len >> 8) & 0xFF;
++    pes[pidx++] =  body_len       & 0xFF;
++    pes[pidx++] = pes_stuffing ? 0x84 : 0x80;
++    pes[pidx++] = 0x80;
++    pes[pidx++] = 0x05 + pes_stuffing; /* PES_header_data_length */
++    encode_pts(&pes[pidx], 0x2, pts_90k);
++    pidx += 5;
++    memset(&pes[pidx], 0xFF, pes_stuffing);
++    pidx += pes_stuffing;
++    memcpy(&pes[pidx], payload, payload_len);
++    pidx += payload_len;
++
++    /* Fit everything (PCR-in-AF + PES) into a single TS packet. */
++    uint8_t pkt[TS_PACKET_SIZE];
++    int af_len = (pcr_90k >= 0) ? 8 : 0;
++    int max_payload = TS_PACKET_SIZE - 4 - af_len;
++    int payload_in_first = pidx < max_payload ? pidx : max_payload;
++    int total_af = af_len ? af_len : 0;
++    int leftover = max_payload - payload_in_first;
++    if (leftover > 0) {
++        total_af += leftover;
++        max_payload -= leftover;
++    }
++    ts_header(pkt, pid, 1, *cc_state & 0x0F, total_af > 0, 1);
++    *cc_state = (*cc_state + 1) & 0x0F;
++    int off = 4;
++    if (total_af > 0)
++        off += make_af(&pkt[off], total_af, pcr_90k);
++    memcpy(&pkt[off], pes, payload_in_first);
++    off += payload_in_first;
++    if (off != TS_PACKET_SIZE) {
++        fprintf(stderr, "bad packet size %d\n", off);
++        return -1;
++    }
++    if (fwrite(pkt, 1, TS_PACKET_SIZE, f) != TS_PACKET_SIZE)
++        return -1;
++
++    /* If PES did not fit, emit continuation packets. */
++    int sent = payload_in_first;
++    while (sent < pidx) {
++        int remaining = pidx - sent;
++        int cap = TS_PACKET_SIZE - 4;
++        int chunk = remaining < cap ? remaining : cap;
++        int pad_af = cap - chunk;
++        ts_header(pkt, pid, 0, *cc_state & 0x0F, pad_af > 0, 1);
++        *cc_state = (*cc_state + 1) & 0x0F;
++        off = 4;
++        if (pad_af > 0)
++            off += make_af(&pkt[off], pad_af, -1);
++        memcpy(&pkt[off], &pes[sent], chunk);
++        off += chunk;
++        if (off != TS_PACKET_SIZE) {
++            fprintf(stderr, "bad continuation size %d\n", off);
++            return -1;
++        }
++        if (fwrite(pkt, 1, TS_PACKET_SIZE, f) != TS_PACKET_SIZE)
++            return -1;
++        sent += chunk;
++    }
++    return 0;
++}
++
++static uint8_t reverse_bits(uint8_t v)
++{
++    uint8_t out = 0;
++    for (int i = 0; i < 8; i++) {
++        out = (out << 1) | (v & 1);
++        v >>= 1;
++    }
++    return out;
++}
++
++static uint8_t odd_parity(uint8_t v)
++{
++    unsigned count = 0;
++
++    v &= 0x7F;
++    for (int i = 0; i < 7; i++)
++        count += (v >> i) & 1;
++    return count & 1 ? v : v | 0x80;
++}
++
++static void teletext_addr(uint8_t out[2], unsigned row, unsigned magazine)
++{
++    unsigned value = (row << 3) | (magazine & 7);
++
++    out[0] = ham8[value & 0x0F];
++    out[1] = ham8[(value >> 4) & 0x0F];
++}
++
++static void teletext_row(uint8_t out[42], unsigned row, const char *text)
++{
++    memset(out, ' ', 42);
++    teletext_addr(out, row, 0);
++
++    if (row == 0) {
++        static const char label[] = "FFMPEG ROLLOVER";
++
++        out[2] = ham8[0x8];
++        out[3] = ham8[0x8];
++        out[4] = ham8[0x0];
++        out[5] = ham8[0x8]; /* erase page */
++        out[6] = ham8[0x0];
++        out[7] = ham8[0x8]; /* subtitle flag */
++        out[8] = ham8[0x1]; /* suppress header flag */
++        out[9] = ham8[0x0];
++
++        for (size_t i = 0; i < sizeof(label) - 1; i++)
++            out[10 + i] = odd_parity(label[i]);
++    } else {
++        size_t len = strlen(text);
++
++        if (len > 40)
++            len = 40;
++        for (size_t i = 0; i < len; i++)
++            out[2 + i] = odd_parity(text[i]);
++    }
++
++    for (int i = 0; i < 42; i++)
++        out[i] = reverse_bits(out[i]);
++}
++
++static void teletext_data_unit(uint8_t **p, unsigned row, unsigned line_offset,
++                               const char *text)
++{
++    uint8_t line[42];
++
++    *(*p)++ = 0x02;
++    *(*p)++ = 0x2C;
++    *(*p)++ = 0x20 | line_offset;
++    *(*p)++ = 0xE4;
++    teletext_row(line, row, text);
++    memcpy(*p, line, sizeof(line));
++    *p += sizeof(line);
++}
++
++static size_t make_teletext_payload(uint8_t out[139], unsigned page)
++{
++    uint8_t *p = out;
++    char text[32];
++
++    snprintf(text, sizeof(text), "HELLO WRAP %u", page);
++    *p++ = 0x10;
++    teletext_data_unit(&p, 0, 7, "");
++    teletext_data_unit(&p, 1, 8, text);
++    teletext_data_unit(&p, 2, 9, "SUBTITLE TEXT");
++    return p - out;
++}
++
++static const uint8_t video_payload[] = { 0x00, 0x00, 0x01, 0xB7 };
++static const uint8_t dvbsub_payload[] = {
++    0x20, 0x00, 0x0F, 0x80, 0x00, 0x01, 0x00, 0x00, 0xFF,
++};
++
++int main(int argc, char **argv)
++{
++    const char *out_path = argc > 1 ? argv[1] : "-";
++    enum subtitle_kind kind = SUBTITLE_KIND_DVBSUB;
++    enum scenario_kind scenario_kind = SCENARIO_KIND_ONE_WRAP;
++    unsigned sub_packet = 0;
++    FILE *f = (strcmp(out_path, "-") == 0) ? stdout : fopen(out_path, "wb");
++    if (!f) {
++        perror(out_path);
++        return 1;
++    }
++    for (int i = 2; i < argc; i++) {
++        if (!strcmp(argv[i], "teletext"))
++            kind = SUBTITLE_KIND_TELETEXT;
++        else if (!strcmp(argv[i], "dvbsub"))
++            kind = SUBTITLE_KIND_DVBSUB;
++        else if (!strcmp(argv[i], "multiwrap"))
++            scenario_kind = SCENARIO_KIND_MULTI_WRAP;
++        else {
++            fprintf(stderr, "unknown option: %s\n", argv[i]);
++            return 1;
++        }
++    }
++
++    /* first_dts must be in the ADD_OFFSET range (>60 s and < 2^33 - 2^30 ticks)
++     * so that libavformat's update_wrap_reference picks the ADD_OFFSET branch. */
++    const int64_t first_dts = 7200000000LL;   /* ~22.22 h */
++    const int64_t ref       = first_dts - 60LL * HZ;
++    const int64_t sec_02    = HZ /  50;       /* 0.02 s */
++    const int64_t sec_60    = 60LL * HZ;
++    const int64_t sec_1     = 1LL * HZ;
++    const int64_t sec_01    = HZ / 10;        /* 0.1 s */
++    const int64_t sec_05    = HZ / 2;         /* 0.5 s */
++    const int64_t sec_06    = (6LL * HZ) / 10;
++    const int64_t sec_8000  = 8000LL * HZ;
++
++    if (write_pat(f) || write_pmt(f, kind))
++        return 1;
++
++    struct scenario_step { int v; int64_t pts; int with_pcr; };
++    struct scenario_step one_wrap[] = {
++        /* A: anchor */
++        { 1, first_dts,            1 },
++        { 0, first_dts + sec_02,   0 },
++        /* B: still pre-wrap */
++        { 1, first_dts + sec_60,            1 },
++        { 0, first_dts + sec_60 + sec_02,   0 },
++        /* C: 1 s post-wrap, raw well below reference */
++        { 1, sec_1,                 1 },
++        { 0, sec_1 + sec_02,        0 },
++        /* D: raw approaches reference from below */
++        { 1, ref - sec_01,                 1 },
++        { 0, ref - sec_01 + sec_02,        0 },
++        /* E: raw crosses back past reference (bug trigger without the fix) */
++        { 1, first_dts + sec_01,            1 },
++        { 0, first_dts + sec_01 + sec_02,   0 },
++        /* tail: more packets so ts_discontinuity_detect has history */
++        { 1, first_dts + sec_01 + sec_05,   1 },
++        { 0, first_dts + sec_01 + sec_06,   0 },
++    };
++    struct scenario_step multi_wrap[] = {
++        /* First pass through the one-wrap repair path. */
++        { 1, first_dts,            1 },
++        { 0, first_dts + sec_02,   0 },
++        { 1, first_dts + sec_60,            1 },
++        { 0, first_dts + sec_60 + sec_02,   0 },
++        { 1, sec_1,                1 },
++        { 0, sec_1 + sec_02,       0 },
++        { 1, ref - sec_01,                 1 },
++        { 0, ref - sec_01 + sec_02,        0 },
++        { 1, first_dts + sec_01,           1 },
++        { 0, first_dts + sec_01 + sec_02,  0 },
++
++        /* Stay in the first repaired epoch until the next physical wrap. */
++        { 1, first_dts + sec_8000,          1 },
++        { 0, first_dts + sec_8000 + sec_02, 0 },
++        { 1, WRAP_TICKS - sec_05,           1 },
++        { 0, WRAP_TICKS - sec_05 + sec_02,  0 },
++
++        /* Second physical wrap: libavformat adds one epoch, ffmpeg adds one. */
++        { 1, sec_1,                         1 },
++        { 0, sec_1 + sec_02,                0 },
++        { 1, 1LL * sec_8000,                1 },
++        { 0, 1LL * sec_8000 + sec_02,       0 },
++        { 1, 2LL * sec_8000,                1 },
++        { 0, 2LL * sec_8000 + sec_02,       0 },
++        { 1, 3LL * sec_8000,                1 },
++        { 0, 3LL * sec_8000 + sec_02,       0 },
++        { 1, 4LL * sec_8000,                1 },
++        { 0, 4LL * sec_8000 + sec_02,       0 },
++        { 1, 5LL * sec_8000,                1 },
++        { 0, 5LL * sec_8000 + sec_02,       0 },
++        { 1, 6LL * sec_8000,                1 },
++        { 0, 6LL * sec_8000 + sec_02,       0 },
++        { 1, 7LL * sec_8000,                1 },
++        { 0, 7LL * sec_8000 + sec_02,       0 },
++        { 1, 8LL * sec_8000,                1 },
++        { 0, 8LL * sec_8000 + sec_02,       0 },
++        { 1, 9LL * sec_8000,                1 },
++        { 0, 9LL * sec_8000 + sec_02,       0 },
++        { 1, ref - sec_01,                  1 },
++        { 0, ref - sec_01 + sec_02,         0 },
++
++        /* Bug trigger: raw timestamp crosses reference again and needs +2 wraps. */
++        { 1, first_dts + sec_01,            1 },
++        { 0, first_dts + sec_01 + sec_02,   0 },
++        { 1, first_dts + sec_05,            1 },
++        { 0, first_dts + sec_06,            0 },
++    };
++    struct scenario_step *scenario = one_wrap;
++    size_t scenario_count = sizeof(one_wrap)/sizeof(one_wrap[0]);
++
++    if (scenario_kind == SCENARIO_KIND_MULTI_WRAP) {
++        scenario = multi_wrap;
++        scenario_count = sizeof(multi_wrap)/sizeof(multi_wrap[0]);
++    }
++
++    for (size_t i = 0; i < scenario_count; i++) {
++        unsigned pid = scenario[i].v ? VIDEO_PID : SUB_PID;
++        unsigned sid = scenario[i].v ? STREAM_ID_VIDEO : STREAM_ID_PRIV1;
++        unsigned *cc = scenario[i].v ? &cc_video : &cc_sub;
++        const uint8_t *payload = video_payload;
++        uint8_t teletext_payload[139];
++        size_t payload_len = sizeof(video_payload);
++        int pes_stuffing = 0;
++        int64_t pcr = scenario[i].with_pcr ? scenario[i].pts : -1;
++
++        if (!scenario[i].v && kind == SUBTITLE_KIND_TELETEXT) {
++            payload_len = make_teletext_payload(teletext_payload, sub_packet++);
++            payload = teletext_payload;
++            pes_stuffing = 31;
++        } else if (!scenario[i].v) {
++            payload = dvbsub_payload;
++            payload_len = sizeof(dvbsub_payload);
++        }
++
++        if (write_pes_packet(f, pid, sid, scenario[i].pts, pcr,
++                             payload, payload_len, pes_stuffing, cc) < 0)
++            return 1;
++    }
++
++    if (write_pat(f) || write_pmt(f, kind))
++        return 1;
++
++    if (f != stdout)
++        fclose(f);
++    return 0;
++}
+diff --git a/tests/ref/fate/mpegts-copyts-subtitle-multiwrap b/tests/ref/fate/mpegts-copyts-subtitle-multiwrap
+new file mode 100644
+index 0000000000..02823f50ab
+--- /dev/null
++++ b/tests/ref/fate/mpegts-copyts-subtitle-multiwrap
+@@ -0,0 +1,24 @@
++#extradata 0:        5, 0x00160012
++#tb 0: 1/90000
++#media_type 0: subtitle
++#codec_id 0: dvb_subtitle
++0, 7200001800, 7200001800,        0,        6, 0x02dd0090, S=1, MPEGTS Stream ID,        1, 0x00bd00bd
++0, 7205401800, 7205401800,        0,        6, 0x02dd0090, S=1, MPEGTS Stream ID,        1, 0x00bd00bd
++0, 8590026392, 8590026392,        0,        6, 0x02dd0090, S=1, MPEGTS Stream ID,        1, 0x00bd00bd
++0, 15784527392, 15784527392,        0,        6, 0x02dd0090, S=1, MPEGTS Stream ID,        1, 0x00bd00bd
++0, 15789945392, 15789945392,        0,        6, 0x02dd0090, S=1, MPEGTS Stream ID,        1, 0x00bd00bd
++0, 16509936392, 16509936392,        0,        6, 0x02dd0090, S=1, MPEGTS Stream ID,        1, 0x00bd00bd
++0, 17179825984, 17179825984,        0,        6, 0x02dd0090, S=1, MPEGTS Stream ID,        1, 0x00bd00bd
++0, 17179960984, 17179960984,        0,        6, 0x02dd0090, S=1, MPEGTS Stream ID,        1, 0x00bd00bd
++0, 17899870984, 17899870984,        0,        6, 0x02dd0090, S=1, MPEGTS Stream ID,        1, 0x00bd00bd
++0, 18619870984, 18619870984,        0,        6, 0x02dd0090, S=1, MPEGTS Stream ID,        1, 0x00bd00bd
++0, 19339870984, 19339870984,        0,        6, 0x02dd0090, S=1, MPEGTS Stream ID,        1, 0x00bd00bd
++0, 20059870984, 20059870984,        0,        6, 0x02dd0090, S=1, MPEGTS Stream ID,        1, 0x00bd00bd
++0, 20779870984, 20779870984,        0,        6, 0x02dd0090, S=1, MPEGTS Stream ID,        1, 0x00bd00bd
++0, 21499870984, 21499870984,        0,        6, 0x02dd0090, S=1, MPEGTS Stream ID,        1, 0x00bd00bd
++0, 22219870984, 22219870984,        0,        6, 0x02dd0090, S=1, MPEGTS Stream ID,        1, 0x00bd00bd
++0, 22939870984, 22939870984,        0,        6, 0x02dd0090, S=1, MPEGTS Stream ID,        1, 0x00bd00bd
++0, 23659870984, 23659870984,        0,        6, 0x02dd0090, S=1, MPEGTS Stream ID,        1, 0x00bd00bd
++0, 24374461984, 24374461984,        0,        6, 0x02dd0090, S=1, MPEGTS Stream ID,        1, 0x00bd00bd
++0, 24379879984, 24379879984,        0,        6, 0x02dd0090, S=1, MPEGTS Stream ID,        1, 0x00bd00bd
++0, 24379923184, 24379923184,        0,        6, 0x02dd0090, S=1, MPEGTS Stream ID,        1, 0x00bd00bd
+diff --git a/tests/ref/fate/mpegts-copyts-subtitle-wrap b/tests/ref/fate/mpegts-copyts-subtitle-wrap
+new file mode 100644
+index 0000000000..6159331dfe
+--- /dev/null
++++ b/tests/ref/fate/mpegts-copyts-subtitle-wrap
+@@ -0,0 +1,10 @@
++#extradata 0:        5, 0x00160012
++#tb 0: 1/90000
++#media_type 0: subtitle
++#codec_id 0: dvb_subtitle
++0, 7200001800, 7200001800,        0,        6, 0x02dd0090, S=1, MPEGTS Stream ID,        1, 0x00bd00bd
++0, 7205401800, 7205401800,        0,        6, 0x02dd0090, S=1, MPEGTS Stream ID,        1, 0x00bd00bd
++0, 8590026392, 8590026392,        0,        6, 0x02dd0090, S=1, MPEGTS Stream ID,        1, 0x00bd00bd
++0, 15784527392, 15784527392,        0,        6, 0x02dd0090, S=1, MPEGTS Stream ID,        1, 0x00bd00bd
++0, 15789945392, 15789945392,        0,        6, 0x02dd0090, S=1, MPEGTS Stream ID,        1, 0x00bd00bd
++0, 15789997592, 15789997592,        0,        6, 0x02dd0090, S=1, MPEGTS Stream ID,        1, 0x00bd00bd
+diff --git a/tests/ref/fate/mpegts-copyts-teletext-wrap b/tests/ref/fate/mpegts-copyts-teletext-wrap
+new file mode 100644
+index 0000000000..1a645da78b
+--- /dev/null
++++ b/tests/ref/fate/mpegts-copyts-teletext-wrap
+@@ -0,0 +1,10 @@
++#extradata 0:        2, 0x00980090
++#tb 0: 1/90000
++#media_type 0: subtitle
++#codec_id 0: dvb_teletext
++0, 7200001800, 7200001800,        0,      139, 0xd7ca198a, S=1, MPEGTS Stream ID,        1, 0x00bd00bd
++0, 7205401800, 7205401800,        0,      139, 0xfcff1a09, S=1, MPEGTS Stream ID,        1, 0x00bd00bd
++0, 8590026392, 8590026392,        0,      139, 0xea3f19c9, S=1, MPEGTS Stream ID,        1, 0x00bd00bd
++0, 15784527392, 15784527392,        0,      139, 0x10191a4a, S=1, MPEGTS Stream ID,        1, 0x00bd00bd
++0, 15789945392, 15789945392,        0,      139, 0xe0df19a9, S=1, MPEGTS Stream ID,        1, 0x00bd00bd
++0, 15789997592, 15789997592,        0,      139, 0x06b91a2a, S=1, MPEGTS Stream ID,        1, 0x00bd00bd
 -- 
 2.50.1 (Apple Git-155)
-
