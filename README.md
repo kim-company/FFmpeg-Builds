@@ -47,7 +47,7 @@ CI validates shell scripts and the FFmpeg patch stack on branch pushes. Full FFm
 
 Mutable channels such as `stable-8.0`, `prod-8.0`, or `latest` are updated only by the `Promote FFmpeg Build` workflow, which copies assets from an immutable `ffmpeg-*` release without rebuilding.
 
-The release matrix is intentionally LMS-focused: `linux64`/`linuxarm64` `nonfree 8.0` only. Unused BtbN kitchen-sink dependencies such as Whisper, AV1/VVC/APV/AVS codec stacks, hardware acceleration stacks, DVD/Bluray, and filter/device/plugin libraries are omitted.
+The release matrix is intentionally LMS-focused: `linux64`/`linuxarm64` `nonfree-shared 8.0` only, so LMS can use the same patched FFmpeg build for both command-line executables and `libav*` shared-library linkage. Unused BtbN kitchen-sink dependencies such as Whisper, AV1/VVC/APV/AVS codec stacks, hardware acceleration stacks, DVD/Bluray, and filter/device/plugin libraries are omitted.
 
 ### Targets, Variants and Addins
 
