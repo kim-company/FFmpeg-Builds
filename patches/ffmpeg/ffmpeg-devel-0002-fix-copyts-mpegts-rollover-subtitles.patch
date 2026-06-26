@@ -1,15 +1,16 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Daniel Morandini <daniel.morandini@keepinmind.info>
 Date: Fri, 29 May 2026 11:20:00 +0200
-Subject: [PATCH] fftools/ffmpeg_demux: fix copyts MPEG-TS multi-wrap
+Subject: [PATCH] fftools/ffmpeg_demux: fix copyts MPEG-TS sparse-stream multi-wrap
 To: ffmpeg-devel@ffmpeg.org
 
 Under -copyts, ts_discontinuity_detect() needs to distinguish an
 ordinary MPEG-TS PTS epoch wrap from a real input discontinuity. The
 previous copyts repair added one 33-bit wrap directly to packet DTS/PTS
 when that made the packet much closer to the expected next DTS. That
-covered the first reference crossing, including sparse DVB subtitle and
-DVB teletext packets whose spacing must not be collapsed to next_dts.
+covered the first reference crossing, including sparse DVB subtitle,
+DVB teletext, and SCTE-35 data packets whose spacing must not be
+collapsed to next_dts.
 
 Long-running looped MPEG-TS inputs can advance more than one physical
 PTS epoch and later return to the same raw timestamp phase. In that
@@ -23,25 +24,34 @@ much closer than the raw DTS, and also within one eighth of a wrap, so
 large unrelated discontinuities are not silently fast-forwarded. Guard
 the packet tick addition against overflow before touching DTS/PTS.
 
-Add in-tree FATE fixtures for the one-wrap DVB subtitle and teletext
-cases and a new DVB subtitle multi-wrap case. Without the multi-wrap
-repair, the final two packets in fate-mpegts-copyts-subtitle-multiwrap
-are clamped at 24374461984. With the repair, they advance to
-24379879984 and 24379923184.
+Run the repair for sparse data streams under -copyts as well as
+subtitles. FFmpeg classifies SCTE-35 sections as AVMEDIA_TYPE_DATA and
+LMS maps them with -map 0:d, so leaving data outside this gate lets the
+raw wrapped DTS reach the muxer and abort with EINVAL at the 33-bit
+MPEG-TS rollover.
+
+Add in-tree FATE fixtures for one-wrap DVB subtitle, DVB teletext,
+SCTE-35 data, and multi-wrap DVB subtitle/SCTE-35 data cases. Without
+the data-stream repair, fate-mpegts-copyts-scte-wrap aborts when the
+framecrc muxer receives 15784525592 >= 7200009000 on the SCTE stream.
+With the repair, the SCTE DTS sequence advances monotonically across
+one and multiple physical PTS epochs.
 
 Signed-off-by: Daniel Morandini <daniel.morandini@keepinmind.info>
 ---
- fftools/ffmpeg_demux.c                          |  54 ++-
- tests/Makefile                                  |  11 +-
- tests/fate/mpegts.mak                           |  30 +-
- tests/mpegtswrapgen.c                           | 539 ++++++++++++++++++++++++
- tests/ref/fate/mpegts-copyts-subtitle-multiwrap |  24 ++
+ fftools/ffmpeg_demux.c                          |  55 ++-
+ tests/Makefile                                  |  17 +-
+ tests/fate/mpegts.mak                           |  41 +-
+ tests/mpegtswrapgen.c                           | 607 ++++++++++++++++++++++++
+ tests/ref/fate/mpegts-copyts-scte-multiwrap     |  23 +
+ tests/ref/fate/mpegts-copyts-scte-wrap          |   9 +
+ tests/ref/fate/mpegts-copyts-subtitle-multiwrap |  24 +
  tests/ref/fate/mpegts-copyts-subtitle-wrap      |  10 +
  tests/ref/fate/mpegts-copyts-teletext-wrap      |  10 +
- 7 files changed, 669 insertions(+), 9 deletions(-)
+ 9 files changed, 787 insertions(+), 9 deletions(-)
 
 diff --git a/fftools/ffmpeg_demux.c b/fftools/ffmpeg_demux.c
-index 1fee5c9e8e..d6465b7fe1 100644
+index 1fee5c9e8e..81cce042d6 100644
 --- a/fftools/ffmpeg_demux.c
 +++ b/fftools/ffmpeg_demux.c
 @@ -224,13 +224,49 @@ static void ts_discontinuity_detect(Demuxer *d, InputStream *ist,
@@ -99,27 +109,28 @@ index 1fee5c9e8e..d6465b7fe1 100644
      }
  
      if (ds->next_dts != AV_NOPTS_VALUE && !disable_discontinuity_correction) {
-@@ -296,9 +332,13 @@ static void ts_discontinuity_process(Demuxer *d, InputStream *ist,
+@@ -296,9 +332,14 @@ static void ts_discontinuity_process(Demuxer *d, InputStream *ist,
      if (pkt->pts != AV_NOPTS_VALUE)
          pkt->pts += offset;
  
 -    // detect timestamp discontinuities for audio/video
-+    // detect timestamp discontinuities for audio/video. Under -copyts, subtitle
-+    // streams in AVFMT_TS_DISCONT containers need the same MPEG-TS wrap
-+    // correction because libavformat's wrap_timestamp() stops once raw
-+    // timestamps climb back past pts_wrap_reference.
++    // detect timestamp discontinuities for audio/video. Under -copyts, sparse
++    // subtitle/data streams in AVFMT_TS_DISCONT containers need the same
++    // MPEG-TS wrap correction because libavformat's wrap_timestamp() stops
++    // once raw timestamps climb back past pts_wrap_reference.
      if ((ist->par->codec_type == AVMEDIA_TYPE_VIDEO ||
 -         ist->par->codec_type == AVMEDIA_TYPE_AUDIO) &&
 +         ist->par->codec_type == AVMEDIA_TYPE_AUDIO ||
-+         (copy_ts && ist->par->codec_type == AVMEDIA_TYPE_SUBTITLE)) &&
++         (copy_ts && (ist->par->codec_type == AVMEDIA_TYPE_SUBTITLE ||
++                      ist->par->codec_type == AVMEDIA_TYPE_DATA))) &&
          pkt->dts != AV_NOPTS_VALUE)
          ts_discontinuity_detect(d, ist, pkt);
  }
 diff --git a/tests/Makefile b/tests/Makefile
-index 3f4dbaabfd..e3158a8637 100644
+index 3f4dbaabfd..c1bf4aabd1 100644
 --- a/tests/Makefile
 +++ b/tests/Makefile
-@@ -47,11 +47,20 @@ tests/data/vsynth_lena.yuv: tests/rotozoom$(HOSTEXESUF) | tests/data
+@@ -47,11 +47,26 @@ tests/data/vsynth_lena.yuv: tests/rotozoom$(HOSTEXESUF) | tests/data
  tests/data/vsynth3.yuv: tests/videogen$(HOSTEXESUF) | tests/data
  	$(M)$< $@ $(FATEW) $(FATEH)
  
@@ -132,20 +143,26 @@ index 3f4dbaabfd..e3158a8637 100644
 +tests/data/mpegts_multiwrap_subtitle.ts: tests/mpegtswrapgen$(HOSTEXESUF) | tests/data
 +	$(M)$< $@ multiwrap
 +
++tests/data/mpegts_wrap_scte.ts: tests/mpegtswrapgen$(HOSTEXESUF) | tests/data
++	$(M)$< $@ scte35
++
++tests/data/mpegts_multiwrap_scte.ts: tests/mpegtswrapgen$(HOSTEXESUF) | tests/data
++	$(M)$< $@ scte35 multiwrap
++
  tests/test_copy.ffmeta: TAG = COPY
  tests/test_copy.ffmeta: tests/data
  	$(M)cp -f $(SRC_PATH)/tests/test.ffmeta tests/test_copy.ffmeta
  
 -tests/data/%.sw tests/data/asynth% tests/data/vsynth%.yuv tests/vsynth%/00.pgm tests/data/%.nut: TAG = GEN
-+tests/data/%.sw tests/data/asynth% tests/data/vsynth%.yuv tests/vsynth%/00.pgm tests/data/%.nut tests/data/mpegts_wrap_subtitle.ts tests/data/mpegts_wrap_teletext.ts tests/data/mpegts_multiwrap_subtitle.ts: TAG = GEN
++tests/data/%.sw tests/data/asynth% tests/data/vsynth%.yuv tests/vsynth%/00.pgm tests/data/%.nut tests/data/mpegts_wrap_subtitle.ts tests/data/mpegts_wrap_teletext.ts tests/data/mpegts_multiwrap_subtitle.ts tests/data/mpegts_wrap_scte.ts tests/data/mpegts_multiwrap_scte.ts: TAG = GEN
  
  tests/data/filtergraphs/%: TAG = COPY
  tests/data/filtergraphs/%: $(SRC_PATH)/tests/filtergraphs/% | tests/data/filtergraphs
 diff --git a/tests/fate/mpegts.mak b/tests/fate/mpegts.mak
-index eaca8ec289..e2e112503a 100644
+index eaca8ec289..8e83ad44d8 100644
 --- a/tests/fate/mpegts.mak
 +++ b/tests/fate/mpegts.mak
-@@ -22,4 +22,32 @@ fate-mpegts-probe-pmt-merge: CMD = run $(PROBE_CODEC_NAME_COMMAND) -merge_pmt_ve
+@@ -22,4 +22,43 @@ fate-mpegts-probe-pmt-merge: CMD = run $(PROBE_CODEC_NAME_COMMAND) -merge_pmt_ve
  
  FATE_SAMPLES_FFPROBE += $(FATE_MPEGTS_PROBE-yes)
  
@@ -176,18 +193,29 @@ index eaca8ec289..e2e112503a 100644
 +fate-mpegts-copyts-teletext-wrap: tests/data/mpegts_wrap_teletext.ts
 +fate-mpegts-copyts-teletext-wrap: CMD = framecrc -copyts -i $(TARGET_PATH)/tests/data/mpegts_wrap_teletext.ts -map 0:s -c:s copy
 +
++# Regression tests for the same copyts MPEG-TS PTS wrap on SCTE-35 data
++# packets. The SCTE demuxer timestamps these private sections from the program
++# PCR, matching the LMS path that maps SCTE as `-map 0:d`.
++FATE_MPEGTS-$(call FRAMECRC, MPEGTS, , ) += fate-mpegts-copyts-scte-wrap
++fate-mpegts-copyts-scte-wrap: tests/data/mpegts_wrap_scte.ts
++fate-mpegts-copyts-scte-wrap: CMD = framecrc -copyts -i $(TARGET_PATH)/tests/data/mpegts_wrap_scte.ts -map 0:d -c:d copy
++
++FATE_MPEGTS-$(call FRAMECRC, MPEGTS, , ) += fate-mpegts-copyts-scte-multiwrap
++fate-mpegts-copyts-scte-multiwrap: tests/data/mpegts_multiwrap_scte.ts
++fate-mpegts-copyts-scte-multiwrap: CMD = framecrc -copyts -i $(TARGET_PATH)/tests/data/mpegts_multiwrap_scte.ts -map 0:d -c:d copy
++
 +FATE_FFMPEG += $(FATE_MPEGTS-yes)
 +
 +fate-mpegts: $(FATE_MPEGTS_PROBE-yes) $(FATE_MPEGTS-yes)
 diff --git a/tests/mpegtswrapgen.c b/tests/mpegtswrapgen.c
 new file mode 100644
-index 0000000000..a64dd91305
+index 0000000000..e10bd81f13
 --- /dev/null
 +++ b/tests/mpegtswrapgen.c
-@@ -0,0 +1,539 @@
+@@ -0,0 +1,607 @@
 +/*
 + * Generator for a synthetic MPEG-TS file that exercises the 33-bit @ 90 kHz PTS
-+ * wrap on a subtitle stream alongside an MPEG-2 video stream.
++ * wrap on a subtitle or SCTE-35 data stream alongside an MPEG-2 video stream.
 + *
 + * Copyright (c) 2026 the FFmpeg developers
 + *
@@ -238,9 +266,10 @@ index 0000000000..a64dd91305
 +
 +static unsigned cc_video, cc_sub, cc_pat, cc_pmt;
 +
-+enum subtitle_kind {
-+    SUBTITLE_KIND_DVBSUB,
-+    SUBTITLE_KIND_TELETEXT,
++enum payload_kind {
++    PAYLOAD_KIND_DVBSUB,
++    PAYLOAD_KIND_TELETEXT,
++    PAYLOAD_KIND_SCTE35,
 +};
 +
 +enum scenario_kind {
@@ -342,7 +371,7 @@ index 0000000000..a64dd91305
 +    return fwrite(pkt, 1, TS_PACKET_SIZE, f) == TS_PACKET_SIZE ? 0 : -1;
 +}
 +
-+static int write_pmt(FILE *f, enum subtitle_kind kind)
++static int write_pmt(FILE *f, enum payload_kind kind)
 +{
 +    uint8_t section[128];
 +    int idx = 0;
@@ -354,17 +383,25 @@ index 0000000000..a64dd91305
 +    section[idx++] = 0x00;
 +    section[idx++] = 0xE0 | ((VIDEO_PID >> 8) & 0x1F); /* PCR_PID */
 +    section[idx++] = VIDEO_PID & 0xFF;
-+    section[idx++] = 0xF0; section[idx++] = 0x00; /* program_info_length */
++    if (kind == PAYLOAD_KIND_SCTE35) {
++        section[idx++] = 0xF0; section[idx++] = 0x06; /* program_info_length */
++        section[idx++] = 0x05; section[idx++] = 0x04; /* registration_descriptor */
++        section[idx++] = 'C'; section[idx++] = 'U'; section[idx++] = 'E'; section[idx++] = 'I';
++    } else {
++        section[idx++] = 0xF0; section[idx++] = 0x00; /* program_info_length */
++    }
 +    /* Video ES */
 +    section[idx++] = 0x02; /* stream_type = MPEG-2 video */
 +    section[idx++] = 0xE0 | ((VIDEO_PID >> 8) & 0x1F);
 +    section[idx++] = VIDEO_PID & 0xFF;
 +    section[idx++] = 0xF0; section[idx++] = 0x00;
-+    /* DVB subtitle ES */
-+    section[idx++] = 0x06;
++    /* Auxiliary ES */
++    section[idx++] = kind == PAYLOAD_KIND_SCTE35 ? 0x86 : 0x06;
 +    section[idx++] = 0xE0 | ((SUB_PID >> 8) & 0x1F);
 +    section[idx++] = SUB_PID & 0xFF;
-+    if (kind == SUBTITLE_KIND_TELETEXT) {
++    if (kind == PAYLOAD_KIND_SCTE35) {
++        section[idx++] = 0xF0; section[idx++] = 0x00;
++    } else if (kind == PAYLOAD_KIND_TELETEXT) {
 +        /* teletext_descriptor: language eng, subtitles page 888. */
 +        section[idx++] = 0xF0; section[idx++] = 0x07;
 +        section[idx++] = 0x56;
@@ -484,6 +521,56 @@ index 0000000000..a64dd91305
 +    return 0;
 +}
 +
++static size_t make_scte35_section(uint8_t out[64], unsigned event_id)
++{
++    uint8_t body[] = {
++        0x00,                         /* protocol_version */
++        0x00, 0x00,                   /* encrypted_packet, pts_adjustment high bits */
++        0x00, 0x00, 0x00, 0x00,       /* pts_adjustment low bits */
++        0x00,                         /* cw_index */
++        0x00, 0x00,                   /* tier + splice_command_length */
++        0x00,                         /* splice_null command_type */
++        0x00, 0x00,                   /* descriptor_loop_length */
++        event_id & 0xFF,
++    };
++    int idx = 0;
++
++    out[idx++] = 0xFC; /* splice_info_section */
++    int section_length = sizeof(body) + 4;
++    out[idx++] = 0x30 | ((section_length >> 8) & 0x0F);
++    out[idx++] = section_length & 0xFF;
++    memcpy(&out[idx], body, sizeof(body));
++    idx += sizeof(body);
++
++    uint32_t crc = crc32_mpeg2(out, idx);
++    out[idx++] = (crc >> 24) & 0xFF;
++    out[idx++] = (crc >> 16) & 0xFF;
++    out[idx++] = (crc >>  8) & 0xFF;
++    out[idx++] =  crc        & 0xFF;
++
++    return idx;
++}
++
++static int write_section_packet(FILE *f, unsigned pid, const uint8_t *section,
++                                size_t section_len, unsigned *cc_state)
++{
++    uint8_t pkt[TS_PACKET_SIZE];
++    int filled;
++
++    if (section_len > TS_PACKET_SIZE - 5) {
++        fprintf(stderr, "section too large: %zu\n", section_len);
++        return -1;
++    }
++
++    ts_header(pkt, pid, 1, *cc_state & 0x0F, 0, 1);
++    *cc_state = (*cc_state + 1) & 0x0F;
++    pkt[4] = 0x00; /* pointer_field */
++    memcpy(&pkt[5], section, section_len);
++    filled = 5 + section_len;
++    memset(&pkt[filled], 0xFF, TS_PACKET_SIZE - filled);
++    return fwrite(pkt, 1, TS_PACKET_SIZE, f) == TS_PACKET_SIZE ? 0 : -1;
++}
++
 +static uint8_t reverse_bits(uint8_t v)
 +{
 +    uint8_t out = 0;
@@ -579,7 +666,7 @@ index 0000000000..a64dd91305
 +int main(int argc, char **argv)
 +{
 +    const char *out_path = argc > 1 ? argv[1] : "-";
-+    enum subtitle_kind kind = SUBTITLE_KIND_DVBSUB;
++    enum payload_kind kind = PAYLOAD_KIND_DVBSUB;
 +    enum scenario_kind scenario_kind = SCENARIO_KIND_ONE_WRAP;
 +    unsigned sub_packet = 0;
 +    FILE *f = (strcmp(out_path, "-") == 0) ? stdout : fopen(out_path, "wb");
@@ -589,9 +676,11 @@ index 0000000000..a64dd91305
 +    }
 +    for (int i = 2; i < argc; i++) {
 +        if (!strcmp(argv[i], "teletext"))
-+            kind = SUBTITLE_KIND_TELETEXT;
++            kind = PAYLOAD_KIND_TELETEXT;
 +        else if (!strcmp(argv[i], "dvbsub"))
-+            kind = SUBTITLE_KIND_DVBSUB;
++            kind = PAYLOAD_KIND_DVBSUB;
++        else if (!strcmp(argv[i], "scte35") || !strcmp(argv[i], "scte"))
++            kind = PAYLOAD_KIND_SCTE35;
 +        else if (!strcmp(argv[i], "multiwrap"))
 +            scenario_kind = SCENARIO_KIND_MULTI_WRAP;
 +        else {
@@ -703,7 +792,14 @@ index 0000000000..a64dd91305
 +        int pes_stuffing = 0;
 +        int64_t pcr = scenario[i].with_pcr ? scenario[i].pts : -1;
 +
-+        if (!scenario[i].v && kind == SUBTITLE_KIND_TELETEXT) {
++        if (!scenario[i].v && kind == PAYLOAD_KIND_SCTE35) {
++            uint8_t section[64];
++            size_t section_len = make_scte35_section(section, sub_packet++);
++
++            if (write_section_packet(f, pid, section, section_len, cc) < 0)
++                return 1;
++            continue;
++        } else if (!scenario[i].v && kind == PAYLOAD_KIND_TELETEXT) {
 +            payload_len = make_teletext_payload(teletext_payload, sub_packet++);
 +            payload = teletext_payload;
 +            pes_stuffing = 31;
@@ -724,6 +820,50 @@ index 0000000000..a64dd91305
 +        fclose(f);
 +    return 0;
 +}
+diff --git a/tests/ref/fate/mpegts-copyts-scte-multiwrap b/tests/ref/fate/mpegts-copyts-scte-multiwrap
+new file mode 100644
+index 0000000000..23a5ecfcbd
+--- /dev/null
++++ b/tests/ref/fate/mpegts-copyts-scte-multiwrap
+@@ -0,0 +1,23 @@
++#tb 0: 1/90000
++#media_type 0: data
++#codec_id 0: scte_35
++0, 7200000000, 7200000000,        0,       21, 0x1cad02b3
++0, 7205400000, 7205400000,        0,       21, 0x1cf4027f
++0, 8590024592, 8590024592,        0,       21, 0x1e8d0349
++0, 15784525592, 15784525592,        0,       21, 0x1b7c01cf
++0, 15789943592, 15789943592,        0,       21, 0x1d110268
++0, 16509934592, 16509934592,        0,       21, 0x1e500344
++0, 17179824184, 17179824184,        0,       21, 0x1e990310
++0, 17179959184, 17179959184,        0,       21, 0x1cf002d6
++0, 17899869184, 17899869184,        0,       21, 0x1e77033e
++0, 18619869184, 18619869184,        0,       21, 0x1fea0408
++0, 19339869184, 19339869184,        0,       21, 0x1fa30352
++0, 20059869184, 20059869184,        0,       21, 0x1e06033a
++0, 20779869184, 20779869184,        0,       21, 0x1e6b0347
++0, 21499869184, 21499869184,        0,       21, 0x1e7602d1
++0, 22219869184, 22219869184,        0,       21, 0x205f040d
++0, 22939869184, 22939869184,        0,       21, 0x1dca02e5
++0, 23659869184, 23659869184,        0,       21, 0x1da00331
++0, 24374460184, 24374460184,        0,       21, 0x1dc902d5
++0, 24379878184, 24379878184,        0,       21, 0x1f5403e1
++0, 24379914184, 24379914184,        0,       21, 0x1ced02e3
+diff --git a/tests/ref/fate/mpegts-copyts-scte-wrap b/tests/ref/fate/mpegts-copyts-scte-wrap
+new file mode 100644
+index 0000000000..806c089132
+--- /dev/null
++++ b/tests/ref/fate/mpegts-copyts-scte-wrap
+@@ -0,0 +1,9 @@
++#tb 0: 1/90000
++#media_type 0: data
++#codec_id 0: scte_35
++0, 7200000000, 7200000000,        0,       21, 0x1cad02b3
++0, 7205400000, 7205400000,        0,       21, 0x1cf4027f
++0, 8590024592, 8590024592,        0,       21, 0x1e8d0349
++0, 15784525592, 15784525592,        0,       21, 0x1b7c01cf
++0, 15789943592, 15789943592,        0,       21, 0x1d110268
++0, 15789988592, 15789988592,        0,       21, 0x1e500344
 diff --git a/tests/ref/fate/mpegts-copyts-subtitle-multiwrap b/tests/ref/fate/mpegts-copyts-subtitle-multiwrap
 new file mode 100644
 index 0000000000..02823f50ab
@@ -786,5 +926,3 @@ index 0000000000..1a645da78b
 +0, 15784527392, 15784527392,        0,      139, 0x10191a4a, S=1, MPEGTS Stream ID,        1, 0x00bd00bd
 +0, 15789945392, 15789945392,        0,      139, 0xe0df19a9, S=1, MPEGTS Stream ID,        1, 0x00bd00bd
 +0, 15789997592, 15789997592,        0,      139, 0x06b91a2a, S=1, MPEGTS Stream ID,        1, 0x00bd00bd
--- 
-2.50.1 (Apple Git-155)
