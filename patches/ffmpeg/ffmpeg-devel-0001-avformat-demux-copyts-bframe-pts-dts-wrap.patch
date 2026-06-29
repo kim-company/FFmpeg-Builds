@@ -1,0 +1,29 @@
+From 2f568be6ecdb89fbaf503fcd454b17fc53eaa73e Mon Sep 17 00:00:00 2001
+From: t <t@t>
+Date: Mon, 29 Jun 2026 15:30:55 +0200
+Subject: [PATCH] avformat/demux: repair copyts MPEG-TS B-frame pts<dts at
+ 33-bit wrap
+
+---
+ libavformat/demux.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/libavformat/demux.c b/libavformat/demux.c
+index c7be3c44d4..f6909078c6 100644
+--- a/libavformat/demux.c
++++ b/libavformat/demux.c
+@@ -1446,6 +1446,11 @@ static int read_frame_internal(AVFormatContext *s, AVPacket *pkt)
+             sti->need_context_update = 0;
+         }
+ 
++        if (pkt->pts != AV_NOPTS_VALUE && pkt->dts != AV_NOPTS_VALUE &&
++            pkt->pts < pkt->dts && st->pts_wrap_bits < 63 &&
++            pkt->dts - (uint64_t)pkt->pts > (1LL << (st->pts_wrap_bits - 1)))
++            pkt->pts = av_sat_add64(pkt->pts, 1LL << st->pts_wrap_bits);
++
+         if (pkt->pts != AV_NOPTS_VALUE &&
+             pkt->dts != AV_NOPTS_VALUE &&
+             pkt->pts < pkt->dts) {
+-- 
+2.54.0
+
